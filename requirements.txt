@@ -1,0 +1,13 @@
+typer
+python-dotenv
+pydantic
+
+langchain
+langchain-openai
+
+chromadb
+sentence-transformers
+
+tqdm
+rich
+hf_xet
