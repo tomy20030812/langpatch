@@ -1,0 +1,23 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# ===== LangPatch =====
+.langpatch_index/
+patch/
+generated.patch
+*.patch
+*.diff
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
