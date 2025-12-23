@@ -16,16 +16,7 @@ HASH_FILE = "file_hashes.json"
 COLLECTION_NAME = "code_chunks"
 
 def _sha1(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
-
-def load_hashes(index_dir: Path) -> Dict[str, str]:
-    p = index_dir / HASH_FILE
-    if not p.exists():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))
-
-def save_hashes(index_dir: Path, hashes: Dict[str, str]) -> None:
-    (index_dir / HASH_FILE).write_text(json.dumps(hashes, indent=2), encoding="utf-8")
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 def get_chroma_client(index_dir: Path) -> chromadb.Client:
     index_dir.mkdir(parents=True, exist_ok=True)
@@ -34,50 +25,58 @@ def get_chroma_client(index_dir: Path) -> chromadb.Client:
         settings=ChromaSettings(anonymized_telemetry=False),
     )
 
-def get_collection(client: chromadb.Client):
-    return client.get_or_create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+def get_collection(client: chromadb.Client) -> chromadb.Collection:
+    try:
+        return client.get_collection(COLLECTION_NAME)
+    except Exception:
+        return client.create_collection(COLLECTION_NAME)
+
+def load_hashes(index_dir: Path) -> Dict[str, str]:
+    p = index_dir / HASH_FILE
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_hashes(index_dir: Path, hashes: Dict[str, str]) -> None:
+    p = index_dir / HASH_FILE
+    p.write_text(json.dumps(hashes, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def build_or_update_index(
-    index_dir: Path,
-    embed_model: str,
     repo_root: Path,
+    index_dir: Path,
     files: List[Path],
-    max_chars_per_file: int,
+    embed_model: str,
+    batch_size: int = 32,
+    max_chars_per_file: int = 80_000,
 ) -> None:
     client = get_chroma_client(index_dir)
     col = get_collection(client)
+
     model = SentenceTransformer(embed_model, device="cpu")
-
     hashes = load_hashes(index_dir)
-
-    to_update: List[Tuple[Path, str]] = []
-    for f in files:
-        text = read_text_safely(f, max_chars=max_chars_per_file)
-        h = _sha1(text)
-        if hashes.get(str(f)) != h:
-            to_update.append((f, text))
-
-    if not to_update:
-        return
-
-    # remove old chunks for updated files
-    # (simple approach: delete by where metadata.file_path == ...)
-    for f, _ in to_update:
-        try:
-            col.delete(where={"file_path": str(f)})
-        except Exception:
-            pass
 
     ids: List[str] = []
     docs: List[str] = []
     metas: List[dict] = []
 
-    for f, text in tqdm(to_update, desc="Indexing changed files"):
-        if f.suffix == ".py":
-            chunks = chunk_python_file(f, text)
-        else:
-            # non-py fallback: whole file chunk
-            chunks = [CodeChunk(str(f), "__file__", 1, max(1, text.count("\n")+1), text)]
+    for f in tqdm(files, desc="Indexing"):
+        text = read_text_safely(f, max_chars=max_chars_per_file)
+        if not text:
+            continue
+
+        rel = str(f.relative_to(repo_root))
+        h = _sha1(text)
+        if hashes.get(str(f)) == h:
+            continue
+
+        chunks: List[CodeChunk] = chunk_python_file(str(f), text)
+
+        # Delete old chunks for this file (by prefix match)
+        # (Chroma doesn't support prefix delete directly; we just overwrite via new ids)
+        # Note: If duplicates remain, it doesn't break retrieval but wastes space.
 
         for c in chunks:
             cid = f"{c.file_path}:{c.symbol}:{c.start_line}-{c.end_line}"
@@ -89,13 +88,25 @@ def build_or_update_index(
                 "start_line": c.start_line,
                 "end_line": c.end_line,
                 "rel_path": str(Path(c.file_path).relative_to(repo_root)),
+                "snippet": c.text,
             })
 
         hashes[str(f)] = _sha1(text)
 
-    # embed in batches
-    batch_size = 16
-    for i in tqdm(range(0, len(docs), batch_size), desc="Embedding"):
+    if not ids:
+        # nothing to add
+        save_hashes(index_dir, hashes)
+        return
+
+    # upsert by adding; duplicates may occur if ids collide, but ids are stable per file+symbol+range
+    # chroma will error if duplicate ids exist; so delete then add if needed.
+    # here we attempt delete existing ids first.
+    try:
+        col.delete(ids=ids)
+    except Exception:
+        pass
+
+    for i in range(0, len(ids), batch_size):
         batch_docs = docs[i:i+batch_size]
         embs = model.encode(batch_docs, normalize_embeddings=True).tolist()
         col.add(

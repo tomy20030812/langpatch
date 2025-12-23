@@ -1,33 +1,28 @@
 from __future__ import annotations
 
 # =========================
-# ⭐ 关键：让 python cli.py 能找到 package
+# ⭐ 确保 src/ 在 sys.path 中
 # =========================
 import sys
 from pathlib import Path
 
 CURRENT_DIR = Path(__file__).resolve().parent
-SRC_DIR = CURRENT_DIR.parent
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 
 # =========================
-# 现在可以安全 import 了
+# 正常 import 项目模块
 # =========================
-import json
 import os
-from rich import print as rprint
-from rich.panel import Panel
+import json
 from dotenv import load_dotenv
 
+from rich import print as rprint
+from rich.panel import Panel
+
 from langpatch.config import get_settings
-from langpatch.git_utils import (
-    get_current_branch,
-    list_tracked_files,
-    get_head_commit,
-    apply_check,
-)
-from langpatch.fs_utils import filter_files, DEFAULT_EXCLUDES
+from langpatch.fs_utils import filter_files, list_tracked_files
+from langpatch.git_utils import get_current_branch, get_head_commit, apply_check
 from langpatch.indexer import build_or_update_index
 from langpatch.retriever import retrieve_top_chunks
 from langpatch.planner import plan_changes
@@ -35,35 +30,36 @@ from langpatch.patcher import generate_file_patch, merge_diffs
 from langpatch.diff_utils import looks_like_unified_diff, sanitize_diff
 
 
-# =========================
-# 从 .env 读取配置
-# =========================
 load_dotenv()
 
 REPO_PATH = os.getenv("REPO_PATH")
 REQUIREMENT = os.getenv("REQUIREMENT", "").strip()
-PATCH_OUTPUT_DIR = os.getenv("PATCH_OUTPUT_DIR")
-PATCH_FILE_NAME = os.getenv("PATCH_FILE_NAME", "generated.patch")
+PATCH_OUTPUT_DIR = os.getenv("PATCH_OUTPUT_DIR", "./patches")
+PATCH_FILE_NAME = os.getenv("PATCH_FILE_NAME", "langpatch.patch")
 
-if not REPO_PATH:
-    raise RuntimeError("缺少 REPO_PATH（请在 .env 中配置）")
+DEFAULT_EXCLUDES = [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+]
 
-if not REQUIREMENT:
-    raise RuntimeError("缺少 REQUIREMENT（请在 .env 中配置）")
 
-if not PATCH_OUTPUT_DIR:
-    raise RuntimeError("缺少 PATCH_OUTPUT_DIR（请在 .env 中配置）")
-
-
-# =========================
-# 主流程
-# =========================
 def main() -> None:
+    if not REPO_PATH:
+        rprint("[bold red]未设置 REPO_PATH[/bold red]")
+        return
+    if not REQUIREMENT:
+        rprint("[bold red]未设置 REQUIREMENT[/bold red]")
+        return
+
     settings = get_settings()
     repo_root = Path(REPO_PATH).resolve()
     patch_dir = Path(PATCH_OUTPUT_DIR).resolve()
     patch_dir.mkdir(parents=True, exist_ok=True)
-
     patch_path = patch_dir / PATCH_FILE_NAME
 
     rprint(Panel.fit(
@@ -87,13 +83,12 @@ def main() -> None:
 
     rprint(f"[cyan]扫描到文件数:[/cyan] {len(files)}")
 
-    index_dir = (repo_root / settings.index_dir).resolve()
-
+    index_dir = repo_root / ".langpatch_index"
     build_or_update_index(
-        index_dir=index_dir,
-        embed_model=settings.embed_model,
         repo_root=repo_root,
+        index_dir=index_dir,
         files=files,
+        embed_model=settings.embed_model,
         max_chars_per_file=settings.max_chars_per_file,
     )
 
@@ -108,7 +103,15 @@ def main() -> None:
 
     rprint(f"[cyan]命中代码块:[/cyan] {len(chunks)}")
 
-    plan = plan_changes(settings, REQUIREMENT, chunks)
+    if not chunks:
+        rprint("[yellow]未检索到相关代码片段[/yellow]")
+        return
+
+    try:
+        plan = plan_changes(settings, REQUIREMENT, chunks)
+    except Exception as e:
+        rprint(f"[bold red]Planner 失败:[/bold red] {e}")
+        return
 
     rprint(Panel.fit(
         json.dumps(plan, indent=2, ensure_ascii=False),
@@ -124,13 +127,12 @@ def main() -> None:
 
     patches = []
     for rel_path in targets[: settings.max_files_for_llm]:
-        rprint(f"[cyan]生成 patch:[/cyan] {rel_path}")
         fp = generate_file_patch(
             settings=settings,
             repo_root=repo_root,
+            rel_path=rel_path,
             requirement=REQUIREMENT,
             design_notes=plan.get("design_notes", []),
-            rel_path=rel_path,
         )
 
         diff = sanitize_diff(fp.diff)
@@ -140,16 +142,19 @@ def main() -> None:
         patches.append(fp.__class__(fp.rel_path, diff))
 
     final_patch = merge_diffs(patches)
-    patch_path.write_text(final_patch, encoding="utf-8")
+    if not final_patch.strip():
+        rprint("[bold red]Patch 为空，已中止[/bold red]")
+        return
 
+    patch_path.write_text(final_patch, encoding="utf-8")
     rprint(f"[bold green]Patch 已生成:[/bold green] {patch_path}")
 
     ok, msg = apply_check(repo_root, patch_path)
     if ok:
         rprint("[bold green]git apply --check 通过 ✔[/bold green]")
-        rprint(f"应用方式: git apply {patch_path}")
     else:
-        rprint(Panel.fit(msg, title="[red]git apply --check 失败[/red]"))
+        rprint("[bold red]git apply --check 失败 ✘[/bold red]")
+        rprint(msg)
 
 
 if __name__ == "__main__":
